@@ -22,6 +22,8 @@ define([
     dom.style["left"] = "50px";
     dom.style["top"] = "50px";
     dom.style["z-index"] = "100";
+    dom.style["color"] = "white";
+    dom.style["text-shadow"] = "1px 1px 2px black, 0 0 1em black, 0 0 0.2em black";
 
     function message(msg) {
       let lines = msg.split("\n");
