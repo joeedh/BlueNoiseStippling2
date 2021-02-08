@@ -2,9 +2,9 @@ let __appstate = undefined;
 
 define([
   "util", "const", "bluenoise", "draw", "colors", "ui", "spectrum", "indexdb_store", "smoothmask_file",
-  "render", "exportsvg"
+  "render", "exportsvg", "profiles"
 ], function(util, cconst, bluenoise, draw, colors, ui, spectrum, indexdb_store, smoothmask_file,
-            render, exportsvg)
+            render, exportsvg, profiles)
 {
   "use strict";
   
@@ -35,9 +35,13 @@ define([
     return ret;
   }
   
-  let AppState = exports.AppState = class {
+  let AppState = exports.AppState = class AppState {
     constructor(g, canvas) {
+      this.run_timer = undefined;
+
+      this.last_dpi = devicePixelRatio;
       this.bluenoise = new bluenoise.BlueNoise();
+
       this.drawer = new draw.Drawer(this);
       this.image = undefined;
       this.outimage = undefined;
@@ -126,11 +130,99 @@ define([
       this.bluenoise.reset(RASTER_IMAGE ? this.outimage : undefined);
       this.drawer.reset(RASTER_IMAGE ? this.outimage : undefined);
     }
-    
+
+    checkCanvasSize() {
+      let dpi = devicePixelRatio;
+
+      let w = window.innerWidth - 64;
+      let h = window.innerHeight - 64;
+
+      w = ~~(w*dpi);
+      h = ~~(h*dpi);
+
+      let canvas = this.canvas;
+
+      let update = this.last_dpi !== devicePixelRatio;
+      update = update || canvas.width !== w || canvas.height !== h;
+
+      if (!update) {
+        return;
+      }
+
+      console.log("Updating canvas width/height");
+      canvas.width = w;
+      canvas.height = h;
+
+      canvas.style["width"] = (w/dpi) + "px";
+      canvas.style["height"] = (h/dpi) + "px";
+
+      this.last_dpi = devicePixelRatio;
+      window.redraw_all();
+    }
+
     draw() {
+      this.checkCanvasSize();
       this.drawer.draw(this.g);
     }
-    
+
+    run() {
+      if (this.run_timer !== undefined) {
+        this.bluenoise.message("Stopping timer");
+        window.clearInterval(this.run_timer);
+        this.run_timer = undefined;
+        return;
+      }
+
+      this.bluenoise.message("Starting");
+
+      let this2 = this;
+      let task = (function*() {
+        while (!this2.bluenoise.done) {
+          this2.bluenoise.step();
+
+          yield;
+        }
+
+        this2.bluenoise.message("Relaxing");
+
+        for (let i=0; i<RELAX_STEPS; i++) {
+          this2.bluenoise.relax();
+          this2.bluenoise.message("Step", i+1, "of", RELAX_STEPS);
+          yield;
+        }
+      })();
+
+      task = task[Symbol.iterator]();
+
+      this.run_timer = window.setInterval(() => {
+        let time = util.time_ms();
+        let ret;
+
+        while (util.time_ms() - time < 50) {
+          try {
+            ret = task.next();
+          } catch (error) {
+            util.print_stack(error);
+            this.bluenoise.error(error.message);
+            ret = {done: true};
+          }
+
+          if (ret.done) {
+            this.bluenoise.message("Finished");
+
+            window.setTimeout(() => {
+              this.bluenoise.clearMessages();
+            }, 500);
+
+            window.clearInterval(this.run_timer);
+            this.run_timer = undefined;
+            break;
+          }
+        }
+
+        window.redraw_all();
+      }, 15);
+    }
     on_keydown(e) {
       console.log(e.keyCode);
       switch (e.keyCode) {
@@ -368,7 +460,6 @@ define([
         let img = document.createElement("img");
         svg = "data:image/svg+xml," + escape(svg);
 
-        console.log(img);
         img.src = svg;
 
         img.onload = () => {
@@ -396,6 +487,8 @@ define([
     }
     
     on_tick() {
+      this.checkCanvasSize();
+
       this.gui.on_tick();
       this.gui2.on_tick();
     }
@@ -407,11 +500,22 @@ define([
       let gui2 = this.gui2 = new ui.UI("ui2_bn7", window);
       let gui = this.gui = new ui.UI("ui1_bn7", window);
 
+      let profenum = {};
+      for (let k in profiles) {
+        profenum[ui.makeUIName(k)] = k;
+      }
+
       let cpanel = gui.panel("Main");
+
+      cpanel.slider("DIMEN", "Density", 32, 1, 2048, 1, true);
 
       cpanel.button('load_image', "Load Image", function() {
         let input = document.getElementById("input");
         input.click();
+      });
+
+      cpanel.button("run", "Run/Stop", () => {
+        this.run();
       });
 
       cpanel.button("reset", "Reset", function() {
@@ -422,12 +526,156 @@ define([
         redraw_all();
       });
 
+      cpanel.listenum("PROFILE", "Profile", profenum, window.PROFILE||"BASIC", (arg) => {
+        console.log("PROFILE", arg);
+      });
+      cpanel.button("load_profile", "Load Profile", () => {
+        console.log("LOAD PROFILE", window.PROFILE);
+        let prof = profiles[window.PROFILE];
+        if (!prof) {
+          this.bluenoise.error("Error loading profile");
+          return;
+        }
+
+        cconst.loadJSON(prof);
+        this.reset();
+
+        this.gui.update();
+        window.redraw_all();
+      });
+
       cpanel.button("clear", "Clear Saved Data", () => {
         this.clearData();
       });
 
-      colors.gen_colors();
+      let panel, spanel, panel2, panel3;
 
+      spanel = gui.panel("Draw Settings");
+
+      spanel.check("SHOW_DVIMAGE", "Show DvImage");
+      spanel.slider("DRAW_RMUL", "Point Size", 1.0, 0.1, 8.0, 0.01, false, true);
+      spanel.check("SHOW_COLORS", "Show Colors");
+      spanel.check("SCALE_POINTS", "Radius Scale");
+      spanel.check('TRI_MODE', "Triangle Mode");
+
+      let apanel = spanel.panel("Stick Settings")
+
+      apanel.check("DRAW_STICKS", "Draw Sticks");
+      apanel.check("FANCY_STICKS", "Fancy Strokes");
+      apanel.check("STICK_ARROWS", "Use Arrows");
+      apanel.slider("DEBAND_RADIUS", "Swirlyness", 15, 1, 90, 1, true, false, undefined, "Requires reset");
+      apanel.slider("STICK_ROT", "StickRot", 0.0, -180, 180, 0.0001, false, true);
+      apanel.slider("STICK_WIDTH", "StickWidth", 0.0, 0.0001, 12.0, 0.0001, false, true);
+      apanel.slider("STICK_LENGTH", "StickLength", 0.0, 0.0001, 12.0, 0.0001, false, true);
+      apanel.slider("ANIS_W1", "W1", 0.0, -2.0, 2.0, 0.0001, false, false);
+      apanel.slider("ANIS_W2", "W2", 0.0, -2.0, 2.0, 0.0001, false, false);
+      apanel.close();
+
+      panel = gui.panel("Advanced");
+      panel.slider("RENDERED_IMAGE_SIZE", "Rendered Image Size", 1024, 1, 4096, 1, true);
+
+      let dpanel = panel.panel("Colors");
+      dpanel.check("DITHER_COLORS", "Dither Colors");
+      dpanel.slider("DITHER_RAND_FAC", "Dither Random", 0.0, 0.0, 9.0,0.005, false, false);
+      dpanel.check("DITHER_BLUE", "Blue Noise");
+      dpanel.slider("DITHER_BLUE_STEPS", "Dither Uniformity", 6.0, 0.0, 256.0, 0.005, true, false);
+      panel2 = dpanel.panel("Palette");
+      panel2.slider("PAL_COLORS", "Number of Colors (Times 9)", 4, 1, 32, 1, true);
+      panel2.check("ALLOW_PURPLE", "Include Purple In Palette");
+      panel2.check("ALLOW_GREY", "Include Grey In Palette");
+      dpanel.close();
+
+      panel2 = panel.panel("Canvas Position");
+      panel2.slider("SCALE", "Scale", 1.0, 0.05, 5.0, 0.01, false, true);
+      panel2.slider("PANX", "Pan X", 0.0, -1.5, 1.5, 0.01, false, true);
+      panel2.slider("PANY", "Pan Y", 0.0, -1.5, 1.5, 0.01, false, true);
+
+      panel2.close();
+
+      panel3 = panel.panel("Export SVG");
+      panel3.button("save_svg", "Save SVG", () => {
+        console.log("Export SVG!");
+
+        let data = exportsvg.exportSVG(this);
+
+
+        let a = document.createElement("a");
+
+        //data = "data:image/svg;charset=US-ASCII," + encodeURI(data);
+        //a.setAttribute("href", data);
+
+        let blob = new Blob([data], {type : "image/svg"});
+        let url = URL.createObjectURL(blob);
+
+        a.setAttribute("download", "render.svg");
+        a.setAttribute("href", url);
+
+        a.click();
+      });
+
+      let rpanel = panel.panel("Relaxation");
+
+      rpanel.slider("RELAX_STEPS", "Relax Steps", 5, 0, 45, 1, true, false);
+      rpanel.button("relax", "Relax", () => {
+        _appstate.bluenoise.relax();
+        redraw_all();
+      });
+
+      let relaxbut = rpanel.button("relax_loop", "Start Loop", () => {
+        if (_appstate.relaxtimer !== undefined) {
+          relaxbut.domElement.parentNode.children[0].innerHTML = "Start Loop";
+          console.log("stopping timer");
+
+          window.clearInterval(_appstate.relaxtimer);
+          _appstate.relaxtimer = undefined;
+
+          return;
+        }
+
+        relaxbut.domElement.parentNode.children[0].innerHTML = "Stop Loop";
+
+        _appstate.relaxtimer = window.setInterval(() => {
+          _appstate.bluenoise.relax();
+          redraw_all();
+        }, 100);
+      });
+
+      window.relaxbut = relaxbut;
+
+      rpanel.check("ANISOTROPY", "Anisotropic");
+      rpanel.slider("FILTERWID", "Filter Wid", 3.0, 0.001, 7.0, 0.001, false, false);
+      rpanel.slider("ANISOTROPY_FILTERWID", "AnisotropicFilterWid", 3.0, 0.001, 7.0, 0.001, false, false);
+      rpanel.slider("RELAX_SPEED", "Relax Speed", 1.0, 0.001, 8.0, 0.001, true);
+      rpanel.check("RELAX_UPDATE_VECTORS", "Update Vectors");
+
+
+      let fpanel = panel.panel("Image Filtering");
+      fpanel.check("HIST_EQUALIZE", "EqualizeHistogram");
+      fpanel.check("DEBAND_IMAGE", "Blur Derivatives");
+      fpanel.slider("DEBAND_RADIUS", "Blur Radius", 15, 1, 90, 1, true, false);
+      fpanel.slider("DEBAND_BLEND", "BlendWithOriginal", 0.0, 0, 1, 0.0001, false, false);
+
+      fpanel.check("SHARPEN", "Sharpen");
+      fpanel.slider("SHARPNESS", "Sharpness", 0.5, 0.0, 3.5, 0.001, false);
+      fpanel.check('SHARPEN_LUMINENCE', 'Luminence Only');
+      fpanel.check('USE_LAB', 'Use Lab Space');
+      fpanel.close();
+
+      panel2 = gui.panel("Save Tool")
+      panel2.button("save_img", "Save Image", () => {
+        _appstate.renderImage().then((canvas) => {
+          canvas.toBlob((blob) => {
+            let url = URL.createObjectURL(blob);
+
+            window.open(url);
+          });
+        });
+      });
+
+      spanel.close();
+      panel.close();
+
+      colors.gen_colors();
       gui.load();
       gui2.load();
     }
